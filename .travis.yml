@@ -3,4 +3,3 @@ language: rust
 
 before_install:
   - sudo apt-get -y install openvpn --no-install-recommends
-  - sudo ln -s /usr/include/openvpn/openvpn-plugin.h /usr/include/openvpn-plugin.h
