@@ -30,14 +30,22 @@ use std::time::Duration;
 use log::{debug, error, warn};
 use base64::prelude::*;
 use ldap3::{LdapConnAsync};
-use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use tokio::runtime;
+use moka::sync::Cache;
 
 const MODULE: &str = "openvpn-totp";
 
+type StateId = u64;
+
+#[derive(Eq, PartialEq, Hash)]
+struct StateKey {
+    username: String,
+    state_id: StateId,
+}
+
 struct PluginContext {
     runtime: runtime::Runtime,
-    deferredState: SlotMap<DefaultKey, String>
+    deferredState: Cache<StateKey, String>
 }
 
 enum AuthControl {
@@ -61,10 +69,10 @@ impl AuthControl {
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_open_v3(
-    version: std::os::raw::c_int,
+    version: c_int,
     arguments: *const openvpn_plugin_args_open_in,
     retptr: *mut openvpn_plugin_args_open_return,
-) -> std::os::raw::c_int {
+) -> c_int {
     if version < OPENVPN_PLUGIN_STRUCTVER_MIN {
         println!("{}: this plugin is incompatible with the running version of OpenVPN\n", MODULE);
         return OPENVPN_PLUGIN_FUNC_ERROR as c_int
@@ -88,7 +96,12 @@ unsafe extern "C" fn openvpn_plugin_open_v3(
         .build()
         .unwrap();
 
-    let cache = SlotMap::new();
+    // TODO Configurable
+    let cache = Cache::builder()
+        .time_to_live(Duration::from_secs(60))
+        .max_capacity(10_000)
+        .build();
+
 
     let context = Box::new(PluginContext{
         runtime,
@@ -98,7 +111,7 @@ unsafe extern "C" fn openvpn_plugin_open_v3(
     retptr.type_mask = OPENVPN_PLUGIN_MASK(OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY);
     retptr.handle = Box::into_raw(context) as openvpn_plugin_handle_t;
 
-    return OPENVPN_PLUGIN_FUNC_SUCCESS as c_int;
+    OPENVPN_PLUGIN_FUNC_SUCCESS as c_int
 }
 
 fn OPENVPN_PLUGIN_MASK(flag: u32) -> c_int {
@@ -116,10 +129,10 @@ struct OpenvpnEnv<'s> {
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_func_v3(
-    version: ::std::os::raw::c_int,
+    version: c_int,
     arguments: *const openvpn_plugin_args_func_in,
     _retptr: *mut openvpn_plugin_args_func_return,
-) -> std::os::raw::c_int {
+) -> c_int {
     if version < OPENVPN_PLUGIN_STRUCTVER_MIN {
         println!("{}: this plugin is incompatible with the running version of OpenVPN\n", MODULE);
         return OPENVPN_PLUGIN_FUNC_ERROR as c_int
@@ -160,24 +173,25 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
                     return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
                 };
 
-                let Some((int_bytes, _)) = state.split_at_checked(size_of::<u64>()) else {
+                let Some((int_bytes, _)) = state.split_at_checked(size_of::<StateId>()) else {
                     error!("Could not decode state {}", state_id);
                     return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
                 };
-
 
                 let Ok(int_bytes): Result<[u8;size_of::<u64>()], _> = int_bytes.try_into() else {
                     error!("Could not decode state {}", state_id);
                     return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
                 };
 
-                let key_data = KeyData::from_ffi(u64::from_ne_bytes(int_bytes));
-                let key = DefaultKey::from(key_data);
+                let state_key = StateKey {
+                    username: user.to_string(),
+                    state_id: StateId::from_ne_bytes(int_bytes),
+                };
 
-                let saved_pw = context.deferredState.get(key);
+                let saved_pw = context.deferredState.remove(&state_key);
 
                 let Some(saved_pw) = saved_pw else {
-                    error!("Could not find saved_pw under state {}", state_id);
+                    error!("Could not find saved_pw under state {}", &state_id);
                     return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
                 };
 
@@ -200,16 +214,21 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
                 return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
             };
 
+            let key = rand::random::<StateId>();
+            let state_id = BASE64_STANDARD.encode(&key.to_ne_bytes());
+            let username_base64 = BASE64_STANDARD.encode(user);
+
             /*
              Can't store the password in per_client_context because the client actually disconnects and
              thus has a new context on the TOTP reconnect.
 
              -> Store in global context.
              */
-            let key = context.deferredState.insert(String::from(password));
-
-            let state_id = BASE64_STANDARD.encode(key.data().as_ffi().to_ne_bytes());
-            let username_base64 = BASE64_STANDARD.encode(user);
+            let state_key = StateKey {
+                username: user.to_string(),
+                state_id: key,
+            };
+            context.deferredState.insert(state_key, String::from(password));
 
             let response = format!("CRV1:R,E:{}:{}:Enter Your OTP Code", state_id, username_base64);
             if let Err(err) = file.write_all(response.as_bytes()) {
@@ -221,7 +240,7 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
         }
     }
 
-    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+    OPENVPN_PLUGIN_FUNC_ERROR as c_int
 }
 
 fn check_credentials_async(runtime: &runtime::Runtime, auth_control_file: String, username: String, password: String) -> () {
@@ -229,7 +248,7 @@ fn check_credentials_async(runtime: &runtime::Runtime, auth_control_file: String
 
         let Ok((conn, mut ldap)) = LdapConnAsync::new("TODO").await else {
             error!("Could not connect to ldap server");
-            // TODO Write auth failure and log
+            write_auth_result(&auth_control_file, AuthControl::Failure);
             return;
         };
 
@@ -254,16 +273,21 @@ fn check_credentials_async(runtime: &runtime::Runtime, auth_control_file: String
 
         let _ = ldap.unbind().await;
 
-        let file = File::create(&auth_control_file);
-        let Ok(mut file) = file else {
-            warn!("Could not open auth_control_file: {}", auth_control_file);
-            return;
-        };
-
-        if let Err(err) = file.write_all(&[outcome.value()]) {
-            warn!("Could not write auth_control_file: {} {}", auth_control_file, err);
-        }
+        write_auth_result(&auth_control_file, outcome)
     });
+}
+
+fn write_auth_result(auth_control_file: &String, outcome: AuthControl) {
+    let file = File::create(&auth_control_file);
+    let Ok(mut file) = file else {
+        warn!("Could not open auth_control_file: {}", auth_control_file);
+        return;
+    };
+
+    if let Err(err) = file.write_all(&[outcome.value()]) {
+        warn!("Could not write auth_control_file: {} {}", auth_control_file, err);
+        return;
+    }
 }
 
 fn map_env<'a>(envp: *mut *const c_char) -> OpenvpnEnv<'a> {
@@ -310,10 +334,10 @@ unsafe extern "C" fn openvpn_plugin_close_v1(handle: openvpn_plugin_handle_t) {
     context.runtime.shutdown_timeout(Duration::from_mins(1));
 }
 
-const OPENVPN_PLUGIN_VERSION_MIN: std::os::raw::c_int = 3;
-const OPENVPN_PLUGIN_STRUCTVER_MIN: std::os::raw::c_int = 5;
+const OPENVPN_PLUGIN_VERSION_MIN: c_int = 3;
+const OPENVPN_PLUGIN_STRUCTVER_MIN: c_int = 5;
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn openvpn_plugin_min_version_required_v1() -> ::std::os::raw::c_int {
-    return OPENVPN_PLUGIN_VERSION_MIN;
+unsafe extern "C" fn openvpn_plugin_min_version_required_v1() -> c_int {
+    OPENVPN_PLUGIN_VERSION_MIN
 }
