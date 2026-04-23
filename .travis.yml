@@ -1,5 +1,14 @@
 dist: noble
 language: rust
 
+rust:
+  - stable
+  - beta
+
 before_install:
   - sudo apt-get -y install openvpn --no-install-recommends
+  - rustup component add clippy
+  -
+script:
+  - cargo clippy --all-targets --all-features -- -D warnings
+  - cargo test
