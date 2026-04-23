@@ -14,7 +14,7 @@
    limitations under the License.
  */
 
-use crate::{openvpn_plugin_log_flags_t_PLOG_DEBUG, openvpn_plugin_log_flags_t_PLOG_ERR, openvpn_plugin_log_flags_t_PLOG_NOTE, openvpn_plugin_log_flags_t_PLOG_WARN, plugin_log_t};
+use crate::openvpn::{openvpn_plugin_log_flags_t_PLOG_DEBUG, openvpn_plugin_log_flags_t_PLOG_ERR, openvpn_plugin_log_flags_t_PLOG_NOTE, openvpn_plugin_log_flags_t_PLOG_WARN, plugin_log_t};
 use log::{Level, LevelFilter, Metadata, Record, SetLoggerError};
 use std::ffi::CString;
 use std::str::FromStr;
@@ -73,7 +73,7 @@ impl log::Log for PluginLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            let logFn = self.plugin_log.unwrap();
+            let log_fn = self.plugin_log.unwrap();
             let name = self.name.as_ptr();
 
             let level = match record.level() {
@@ -85,7 +85,7 @@ impl log::Log for PluginLogger {
 
             let message = CString::new(format!("{}", record.args()));
 
-            if let (Some(plugin_log), Ok(message)) = (logFn, message) {
+            if let (Some(plugin_log), Ok(message)) = (log_fn, message) {
                 unsafe {
                     plugin_log(level, name, message.as_ptr());
                 }
