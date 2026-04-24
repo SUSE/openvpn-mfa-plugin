@@ -13,15 +13,12 @@
    See the License for the specific language governing permissions and
    limitations under the License.
  */
-
-
 use crate::plugin_logger::PluginLogger;
 use std::ffi::{c_int};
 use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
 use log::{error, info, warn};
-use base64::prelude::*;
 use tokio::runtime;
 use moka::sync::Cache;
 use crate::config;
@@ -29,16 +26,10 @@ use crate::config::Config;
 use crate::env::OpenvpnEnv;
 use crate::ldap::{login, login_totp};
 use crate::openvpn::{openvpn_plugin_args_func_in, openvpn_plugin_args_func_return, openvpn_plugin_args_open_in, openvpn_plugin_args_open_return, openvpn_plugin_handle_t, OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY, OPENVPN_PLUGIN_FUNC_DEFERRED, OPENVPN_PLUGIN_FUNC_ERROR, OPENVPN_PLUGIN_FUNC_SUCCESS};
+use crate::state::StateKey;
 
 const MODULE: &str = "openvpn-totp";
 
-type StateId = u64;
-
-#[derive(Eq, PartialEq, Hash)]
-struct StateKey {
-    username: String,
-    state_id: StateId,
-}
 
 struct PluginContext {
     runtime: runtime::Runtime,
@@ -113,18 +104,15 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
 
     let env = OpenvpnEnv::from_open_vpn(arguments.envp);
 
+    let Some(auth_control_file) = *env.auth_control_file() else {
+        error!("Did not receive auth_control_file");
+        return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+    };
+
     if let (Some(user), Some(password)) = (*env.username(), *env.password()) {
-
-        let Some(auth_control_file) = *env.auth_control_file() else {
-            error!("Did not receive auth_control_file");
-            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
-        };
-
         if let Some(common_name) = *env.common_name() {
             if !common_name.eq(user) {
-                if let Some(auth_failed_reason_file) = env.auth_failed_reason_file() {
-                    write_auth_failed_reason(auth_failed_reason_file, "CN does not match username");
-                }
+                write_auth_failed_reason(&env, "CN does not match username");
                 return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
             }
 
@@ -134,81 +122,67 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
         }
 
         // TOTP response
-        if password.starts_with("CRV1:") {
-            // Example: CRV1::T20wMXU3Rmg0THJHQlM3dWgwU1dtendhYlVpR2lXNmw=::123456
-            let parts = password.splitn(5, ':');
-            let mut parts = parts.skip(2); // CRV1 prefix & flags (empty)
-            let state_id = parts.next();
-            let mut parts = parts.skip(1);
-            let totp = parts.next();
+        // Example: CRV1::T20wMXU3Rmg0THJHQlM3dWgwU1dtendhYlVpR2lXNmw=::123456
+        // If any of these checks are not ok assume that this is actually a password and not a TOTP response.
+        if password.starts_with("CRV1:")
+            && let Some((state_id, totp)) = parse_crv_response(password)
+            && let Ok(state_key) = StateKey::from_state(user, state_id)
+        {
+            let saved_pw = context.deferred_state.remove(&state_key);
 
-            if let (Some(state_id), Some(totp)) = (state_id, totp) {
-                let Ok(state) = BASE64_STANDARD.decode(state_id) else {
-                    error!("Could not decode state {}", state_id);
-                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
-                };
-
-                let Some((int_bytes, _)) = state.split_at_checked(size_of::<StateId>()) else {
-                    error!("Could not decode state {}", state_id);
-                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
-                };
-
-                let Ok(int_bytes): Result<[u8;size_of::<u64>()], _> = int_bytes.try_into() else {
-                    error!("Could not decode state {}", state_id);
-                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
-                };
-
-                let state_key = StateKey {
-                    username: user.to_string(),
-                    state_id: StateId::from_ne_bytes(int_bytes),
-                };
-
-                let saved_pw = context.deferred_state.remove(&state_key);
-
-                let Some(saved_pw) = saved_pw else {
-                    error!("Could not find saved_pw under state {}", &state_id);
-                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
-                };
+            let Some(saved_pw) = saved_pw else {
+                error!("Could not find saved_pw under state {}", &state_id);
+                return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+            };
 
 
-                // Start the credentials check in the background
-                login_totp(&context.runtime, &context.config, String::from(auth_control_file), user, saved_pw.as_str(), totp);
+            // Start the credentials check in the background
+            login_totp(&context.runtime, &context.config, String::from(auth_control_file), user, saved_pw.as_str(), totp);
 
-                return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
-            }
-
-            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+            return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
         }
 
         // No cert provided. Send TOTP challenge
-        if let Some(auth_failed_reason_file) = env.auth_failed_reason_file() {
-
-            let key = rand::random::<StateId>();
-            let state_id = BASE64_STANDARD.encode(key.to_ne_bytes());
-            let username_base64 = BASE64_STANDARD.encode(user);
-
-            /*
-             Can't store the password in per_client_context because the client actually disconnects and
-             thus has a new context on the TOTP reconnect.
-
-             -> Store in global context.
-             */
-            let state_key = StateKey {
-                username: user.to_string(),
-                state_id: key,
-            };
-            context.deferred_state.insert(state_key, String::from(password));
-            let response = format!("CRV1:R,E:{}:{}:Enter Your OTP Code", state_id, username_base64);
-
-            write_auth_failed_reason(auth_failed_reason_file, &response);
-            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
-        }
+        send_totp_challenge(context, user, password, &env);
+        return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
     }
 
     OPENVPN_PLUGIN_FUNC_ERROR as c_int
 }
 
-fn write_auth_failed_reason(auth_failed_reason_file: &&str, response: &str) {
+fn parse_crv_response(password: &str) -> Option<(&str, &str)> {
+    let parts = password.splitn(5, ':');
+    let mut parts = parts.skip(2); // CRV1 prefix & flags (empty)
+    let state_id = parts.next();
+    let mut parts = parts.skip(1);
+    let totp = parts.next();
+
+    if let (Some(state_id), Some(totp)) = (state_id, totp) {
+        return Some((state_id, totp));
+    }
+
+    None
+}
+
+fn send_totp_challenge(context: &mut PluginContext, user: &str, password: &str, env: &OpenvpnEnv) {
+    /*
+     Can't store the password in per_client_context because the client actually disconnects and
+     thus has a new context on the TOTP reconnect.
+
+     -> Store in global context.
+     */
+    let state_key = StateKey::new(user);
+    let response = format!("CRV1:R,E:{}:{}:Enter Your OTP Code", state_key.encoded_state(), state_key.encoded_user());
+
+    context.deferred_state.insert(state_key, String::from(password));
+    write_auth_failed_reason(env, &response);
+}
+
+fn write_auth_failed_reason(env: &OpenvpnEnv, response: &str) {
+    let Some(auth_failed_reason_file) = env.auth_failed_reason_file() else {
+        return
+    };
+
     let file = File::create(auth_failed_reason_file);
 
     let Ok(mut file) = file else {
