@@ -11,7 +11,7 @@
 ## OpenVPN Configuration
 Add the following to /etc/openvpn/openvpn.conf
 ```
-plugin /usr/lib/openvpn/plugins/libopenvpn_mfa.so --ldap ldaps://172.17.0.1:30636 --dn-totp "OU=totp,DC=ovpn,DC=ldap,DC=suse,DC=com" --dn "ou=users,ou=cert,dc=ovpn,dc=ldap,dc=suse,dc=com"
+plugin /usr/lib/openvpn/plugins/libopenvpn_mfa.so --ldap ldaps://172.17.0.1:30636 --dn-totp "cn={},ou=users,ou=totp,dc=ovpn,dc=ldap,dc=suse,dc=com" --dn "cn={},ou=users,ou=cert,dc=ovpn,dc=ldap,dc=suse,dc=com"
 verify-client-cert optional
 username-as-common-name
 ```
