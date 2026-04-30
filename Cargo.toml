@@ -19,3 +19,6 @@ moka = { version = "0.12.15", features = ["sync"] }
 rand = "0.10.1"
 getset = "0.1.6"
 clap = { version = "4.6.1", features = ["derive"] }
+
+[profile.release]
+strip = true
