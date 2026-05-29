@@ -18,6 +18,7 @@ use std::ffi::{c_int};
 use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
+use base64::prelude::*;
 use log::{error, info, warn};
 use tokio::runtime;
 use moka::sync::Cache;
@@ -121,6 +122,15 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
             return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
         }
 
+        // Static challenge response
+        // Example: SCRV1:cGFzc3dvcmQ=:dG90cA==
+        if password.starts_with("SCRV1:") && let Some((password, totp)) = parse_scrv_response(password) {
+            // Start the credentials check in the background
+            login_totp(&context.runtime, &context.config, String::from(auth_control_file), user, password.as_str(), totp.as_str());
+            return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
+        }
+
+
         // TOTP response
         // Example: CRV1::T20wMXU3Rmg0THJHQlM3dWgwU1dtendhYlVpR2lXNmw=::123456
         // If any of these checks are not ok assume that this is actually a password and not a TOTP response.
@@ -131,7 +141,7 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
             let saved_pw = context.deferred_state.remove(&state_key);
 
             let Some(saved_pw) = saved_pw else {
-                error!("Could not find saved_pw under state {}", &state_id);
+                error!("Could not find saved_pw under state {}", state_id);
                 return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
             };
 
@@ -148,6 +158,30 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
     }
 
     OPENVPN_PLUGIN_FUNC_ERROR as c_int
+}
+
+fn parse_scrv_response(password: &str) -> Option<(String, String)> {
+    let parts = password.splitn(5, ':');
+    let mut parts = parts.skip(1); // CRV1 prefix & flags (empty)
+    let password_b64 =  parts.next();
+    let totp_b64 = parts.next();
+
+
+    if let (Some(password_b64), Some(totp_b64)) = (password_b64, totp_b64) {
+        let password = BASE64_STANDARD.decode(password_b64);
+        let totp = BASE64_STANDARD.decode(totp_b64);
+
+        if let (Ok(password), Ok(totp)) = (password, totp) {
+            let password = String::from_utf8(password);
+            let totp = String::from_utf8(totp);
+
+            if let (Ok(password), Ok(totp)) = (password, totp) {
+                return Some((password, totp));
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_crv_response(password: &str) -> Option<(&str, &str)> {
