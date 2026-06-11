@@ -17,6 +17,8 @@ use crate::plugin_logger::PluginLogger;
 use std::ffi::{c_int};
 use std::fs::File;
 use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use base64::prelude::*;
 use log::{error, info, warn};
@@ -25,7 +27,7 @@ use moka::sync::Cache;
 use crate::config;
 use crate::config::Config;
 use crate::env::OpenvpnEnv;
-use crate::ldap::{login, login_totp};
+use crate::ldap::LdapClient;
 use crate::openvpn::{openvpn_plugin_args_func_in, openvpn_plugin_args_func_return, openvpn_plugin_args_open_in, openvpn_plugin_args_open_return, openvpn_plugin_handle_t, OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY, OPENVPN_PLUGIN_FUNC_DEFERRED, OPENVPN_PLUGIN_FUNC_ERROR, OPENVPN_PLUGIN_FUNC_SUCCESS};
 use crate::state::StateKey;
 
@@ -33,9 +35,9 @@ const MODULE: &str = "openvpn-totp";
 
 
 struct PluginContext {
-    runtime: runtime::Runtime,
     deferred_state: Cache<StateKey, String>,
-    config: Config,
+    config: Arc<Config>,
+    ldap_client: LdapClient,
 }
 
 #[unsafe(no_mangle)]
@@ -57,12 +59,13 @@ unsafe extern "C" fn openvpn_plugin_open_v3(
     logger.set_plugin_log(plugin_logger);
     logger.init().unwrap();
 
-    let args = unsafe { config::parse_args(arguments) };
+    let args = Arc::new(unsafe { config::parse_args(arguments) });
     info!("Using configuration {:?}", args);
 
     let runtime = runtime::Builder::new_multi_thread()
         .worker_threads(args.threads)
         .enable_io()
+        .enable_time()
         .build()
         .unwrap();
 
@@ -71,9 +74,10 @@ unsafe extern "C" fn openvpn_plugin_open_v3(
         .max_capacity(args.passwords_max)
         .build();
 
+    let ldap = LdapClient::new(runtime, args.clone());
 
     let context = Box::new(PluginContext{
-        runtime,
+        ldap_client: ldap,
         deferred_state: cache,
         config: args,
     });
@@ -135,6 +139,13 @@ fn check_auth_factor(
     Err(AuthFactorError::CertMissing)
 }
 
+fn client_socket_addr(env: &OpenvpnEnv) -> Option<SocketAddr> {
+    if let (Some(ip), Some(port)) = (env.untrusted_ip(), env.untrusted_port()) {
+        return Some(SocketAddr::new(*ip, *port));
+    }
+    None
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_func_v3(
     version: c_int,
@@ -151,20 +162,28 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
 
     let env = OpenvpnEnv::from_open_vpn(arguments.envp);
 
-    let Some(auth_control_file) = *env.auth_control_file() else {
+    let Some(auth_control_file) = env.auth_control_file() else {
         error!("Did not receive auth_control_file");
         return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
     };
 
-    if let (Some(user), Some(password)) = (*env.username(), *env.password()) {
-        match check_auth_factor(*env.common_name(), user, context.config.dn_totp.is_some()) {
+    let client = match client_socket_addr(&env) {
+        Some(client_addr) => client_addr,
+        None => {
+            write_auth_failed_reason(&env, "No client ip provided");
+            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+        }
+    };
+
+    if let (Some(user), Some(password)) = (env.username(), env.password()) {
+        match check_auth_factor(env.common_name().as_ref().map(|cn| cn.as_str()), user, context.config.dn_totp.is_some()) {
             Err(err) => {
                 write_auth_failed_reason(&env, err.as_str());
                 return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
             }
 
             Ok(AuthFactor::Cert) => {
-                login(&context.runtime, &context.config, String::from(auth_control_file), user, password);
+                context.ldap_client.login(&client, auth_control_file, user, password);
                 return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
             }
 
@@ -177,7 +196,7 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
         // Example: SCRV1:cGFzc3dvcmQ=:dG90cA==
         if password.starts_with("SCRV1:") && let Some((password, totp)) = parse_scrv_response(password) {
             // Start the credentials check in the background
-            login_totp(&context.runtime, &context.config, String::from(auth_control_file), user, password.as_str(), totp.as_str());
+            context.ldap_client.login_totp(&client, auth_control_file, user, password.as_str(), totp.as_str());
             return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
         }
 
@@ -198,7 +217,7 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
 
 
             // Start the credentials check in the background
-            login_totp(&context.runtime, &context.config, String::from(auth_control_file), user, saved_pw.as_str(), totp);
+            context.ldap_client.login_totp(&client, auth_control_file, user, saved_pw.as_str(), totp);
 
             return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
         }
@@ -271,12 +290,12 @@ fn write_auth_failed_reason(env: &OpenvpnEnv, response: &str) {
     let file = File::create(auth_failed_reason_file);
 
     let Ok(mut file) = file else {
-        warn!("Could not open auth_failed_reason_file: {}", auth_failed_reason_file);
+        warn!("Could not open auth_failed_reason_file: {}", auth_failed_reason_file.display());
         return;
     };
 
     if let Err(err) = file.write_all(response.as_bytes()) {
-        warn!("Could not write auth_failed_reason_file: {} {}", auth_failed_reason_file, err)
+        warn!("Could not write auth_failed_reason_file: {} {}", auth_failed_reason_file.display(), err)
     }
 }
 
@@ -286,7 +305,7 @@ unsafe extern "C" fn openvpn_plugin_close_v1(handle: openvpn_plugin_handle_t) {
 
     // https://stackoverflow.com/a/46677043
     let context = unsafe { Box::from_raw(handle as *mut PluginContext) }; // Rust auto-drops it
-    context.runtime.shutdown_timeout(Duration::from_mins(1));
+    context.ldap_client.shutdown_timeout(Duration::from_mins(1));
 }
 
 const OPENVPN_PLUGIN_VERSION_MIN: c_int = 3;

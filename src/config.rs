@@ -18,7 +18,7 @@ use std::ffi::CStr;
 use clap::Parser;
 use crate::openvpn::openvpn_plugin_args_open_in;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default, Clone)]
 #[command()]
 pub struct Config {
     /// Connection url for LDAP server
@@ -26,8 +26,8 @@ pub struct Config {
     pub ldap: String,
 
     /// Verify tls on ldap server
-    #[arg(long, default_value_t = true)]
-    pub tls_verify: bool,
+    #[arg(long, default_value_t = false)]
+    pub skip_tls_verify: bool,
 
     /// Dn used for totp based authentication
     #[arg(long)]
@@ -48,6 +48,9 @@ pub struct Config {
     /// Max duration in seconds the passwords are kept in memory for the totp roundtrip.
     #[arg(long, default_value_t = 60)]
     pub passwords_ttl: u64,
+
+    #[arg(long, default_value_t = false)]
+    pub forward_ip: bool,
 }
 
 pub unsafe fn parse_args(arguments: *const openvpn_plugin_args_open_in) -> Config {
