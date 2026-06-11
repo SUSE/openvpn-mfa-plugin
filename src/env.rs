@@ -15,22 +15,27 @@
  */
 
 use std::ffi::CStr;
+use std::net::IpAddr;
 use std::os::raw::c_char;
+use std::path::PathBuf;
+use std::str::FromStr;
 use getset::Getters;
 use log::debug;
 
-#[derive(Default, Debug, Getters)]
+#[derive(Default, Debug, Getters, Clone)]
 #[getset(get = "pub")]
-pub struct OpenvpnEnv<'s> {
-    username: Option<&'s str>,
-    password: Option<&'s str>,
-    common_name: Option<&'s str>,
-    auth_failed_reason_file: Option<&'s str>,
-    auth_control_file: Option<&'s str>,
+pub struct OpenvpnEnv {
+    username: Option<String>,
+    password: Option<String>,
+    common_name: Option<String>,
+    auth_failed_reason_file: Option<PathBuf>,
+    auth_control_file: Option<PathBuf>,
+    untrusted_ip: Option<IpAddr>,
+    untrusted_port: Option<u16>,
 }
 
-impl<'s> OpenvpnEnv<'s> {
-    pub fn from_open_vpn(envp: *mut *const c_char) -> OpenvpnEnv<'s> {
+impl<'s> OpenvpnEnv {
+    pub fn from_open_vpn(envp: *mut *const c_char) -> OpenvpnEnv {
         let mut i = 0;
 
         let mut env = OpenvpnEnv::default();
@@ -54,11 +59,13 @@ impl<'s> OpenvpnEnv<'s> {
                 debug!("ENV {} = {}", key, value);
 
                 match key {
-                    "username" => self.username = Some(value),
-                    "password" => self.password = Some(value),
-                    "common_name" => self.common_name = Some(value),
-                    "auth_failed_reason_file" => self.auth_failed_reason_file = Some(value),
-                    "auth_control_file" => self.auth_control_file = Some(value),
+                    "username" => self.username = Some(String::from(value)),
+                    "password" => self.password = Some(String::from(value)),
+                    "common_name" => self.common_name = Some(String::from(value)),
+                    "auth_failed_reason_file" => self.auth_failed_reason_file = PathBuf::from_str(value).ok(),
+                    "auth_control_file" => self.auth_control_file = PathBuf::from_str(value).ok(),
+                    "untrusted_ip" | "untrusted_ip6" => self.untrusted_ip = IpAddr::from_str(value).ok(),
+                    "untrusted_port" => self.untrusted_port = u16::from_str(value).ok(),
                     _ => ()
                 }
             }

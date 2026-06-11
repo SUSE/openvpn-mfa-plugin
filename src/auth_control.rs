@@ -16,6 +16,7 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use log::warn;
 
 pub enum AuthControl {
@@ -37,14 +38,14 @@ impl AuthControl {
     }
 }
 
-pub fn write_auth_result(auth_control_file: &String, outcome: AuthControl) {
+pub fn write_auth_result(auth_control_file: &Path, outcome: AuthControl) {
     let file = File::create(auth_control_file);
     let Ok(mut file) = file else {
-        warn!("Could not open auth_control_file: {}", auth_control_file);
+        warn!("Could not open auth_control_file: {}", auth_control_file.display());
         return;
     };
 
     if let Err(err) = file.write_all(&[outcome.value()]) {
-        warn!("Could not write auth_control_file: {} {}", auth_control_file, err);
+        warn!("Could not write auth_control_file: {} {}", auth_control_file.display(), err);
     }
 }

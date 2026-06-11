@@ -19,6 +19,16 @@ moka = { version = "0.12.15", features = ["sync"] }
 rand = "0.10.1"
 getset = "0.1.6"
 clap = { version = "4.6.1", features = ["derive"] }
+proxy-protocol-rs = "0.8"
+url = "2.5.8"
+getifs = "0.6.1"
+anyhow = "1.0.102"
+
+[dev-dependencies]
+testcontainers =  {  version = "0.27.3", features = ["http_wait_plain"] }
+tempfile = "3.27.0"
+tracing = "0.1"
+tracing-test = "0.2"
 
 [profile.release]
 strip = true
