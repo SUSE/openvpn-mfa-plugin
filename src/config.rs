@@ -26,8 +26,8 @@ pub struct Config {
     pub ldap: String,
 
     /// Verify tls on ldap server
-    #[arg(long, default_value_t = true)]
-    pub tls_verify: bool,
+    #[arg(long, default_value_t = false)]
+    pub skip_tls_verify: bool,
 
     /// Dn used for totp based authentication
     #[arg(long)]

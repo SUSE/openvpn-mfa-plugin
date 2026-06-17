@@ -34,7 +34,7 @@ pub fn login(runtime: &runtime::Runtime, config: &config::Config, auth_control_f
 fn check_credentials_async(runtime: &runtime::Runtime, config: &config::Config, auth_control_file: String, dn: String, password: String) {
     let url = config.ldap.clone();
     let settings = LdapConnSettings::new()
-        .set_no_tls_verify(!config.tls_verify);
+        .set_no_tls_verify(config.skip_tls_verify);
 
     runtime.spawn(async move {
         let (conn, mut ldap) = match LdapConnAsync::with_settings(settings, url.as_str()).await {
