@@ -89,6 +89,52 @@ fn openvpn_plugin_mask(flag: u32) -> c_int {
     1<<(flag)
 }
 
+#[derive(Debug, PartialEq)]
+pub enum AuthFactor {
+    Cert,
+    Totp,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum AuthFactorError {
+    CertCnMismatch,
+    CertMissing,
+}
+
+impl AuthFactorError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthFactorError::CertCnMismatch => "Certificate provided, but CN does not match the username",
+            AuthFactorError::CertMissing => "Certificate not provided, but required",
+        }
+    }
+}
+
+fn check_auth_factor(
+    common_name: Option<&str>,
+    username: &str,
+    totp_enabled: bool,
+) -> Result<AuthFactor, AuthFactorError> {
+
+    // client certificate present?
+    if let Some(cn) = common_name {
+        if cn != username {
+            return Err(AuthFactorError::CertCnMismatch)
+        }
+
+        return Ok(AuthFactor::Cert);
+    }
+
+    // client certificate not present, allow totp instead?
+    if totp_enabled {
+        return Ok(AuthFactor::Totp);
+    }
+
+    // neither second factor was possible
+    // as totp enablement is a configuration choice, return error fitting a certificate-only deployment
+    Err(AuthFactorError::CertMissing)
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_func_v3(
     version: c_int,
@@ -111,15 +157,20 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
     };
 
     if let (Some(user), Some(password)) = (*env.username(), *env.password()) {
-        if let Some(common_name) = *env.common_name() {
-            if !common_name.eq(user) {
-                write_auth_failed_reason(&env, "CN does not match username");
+        match check_auth_factor(*env.common_name(), user, context.config.dn_totp.is_some()) {
+            Err(err) => {
+                write_auth_failed_reason(&env, err.as_str());
                 return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
             }
 
-            // Start the credentials check in the background
-            login(&context.runtime, &context.config, String::from(auth_control_file), user, password);
-            return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
+            Ok(AuthFactor::Cert) => {
+                login(&context.runtime, &context.config, String::from(auth_control_file), user, password);
+                return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
+            }
+
+            Ok(AuthFactor::Totp) => {
+                // continue below for now
+            }
         }
 
         // Static challenge response
@@ -244,4 +295,33 @@ const OPENVPN_PLUGIN_STRUCTVER_MIN: c_int = 5;
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_min_version_required_v1() -> c_int {
     OPENVPN_PLUGIN_VERSION_MIN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_auth_factor, AuthFactor, AuthFactorError};
+
+    #[test]
+    fn test_auth_with_valid_certificate() {
+        let result = check_auth_factor(Some("alice"), "alice", false);
+        assert_eq!(result, Ok(AuthFactor::Cert));
+    }
+
+    #[test]
+    fn test_auth_fails_on_cn_mismatch() {
+        let result = check_auth_factor(Some("bob"), "alice", false);
+        assert_eq!(result, Err(AuthFactorError::CertCnMismatch));
+    }
+
+    #[test]
+    fn test_auth_fails_no_cert_when_totp_disabled() {
+        let result = check_auth_factor(None, "alice", false);
+        assert_eq!(result, Err(AuthFactorError::CertMissing));
+    }
+
+    #[test]
+    fn test_auth_allows_no_cert_when_totp_enabled() {
+        let result = check_auth_factor(None, "alice", true);
+        assert_eq!(result, Ok(AuthFactor::Totp));
+    }
 }

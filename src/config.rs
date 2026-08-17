@@ -31,7 +31,7 @@ pub struct Config {
 
     /// Dn used for totp based authentication
     #[arg(long)]
-    pub dn_totp: String,
+    pub dn_totp: Option<String>,
 
     /// Dn used for auth without totp
     #[arg(short, long)]
