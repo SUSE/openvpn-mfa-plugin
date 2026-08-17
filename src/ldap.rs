@@ -21,8 +21,9 @@ use crate::auth_control::{write_auth_result, AuthControl};
 use crate::config;
 
 pub fn login_totp(runtime: &runtime::Runtime, config: &config::Config, auth_control_file: String, username: &str, password: &str, totp: &str) {
+    let dn_totp = config.dn_totp.as_ref().expect("login_totp requires dn_totp");
     let password = format!("{};{}", password, totp);
-    let dn = config.dn_totp.replacen("{}", &dn_escape(username), 1);
+    let dn = dn_totp.replacen("{}", &dn_escape(username), 1);
     check_credentials_async(runtime, config, auth_control_file, dn, password)
 }
 
