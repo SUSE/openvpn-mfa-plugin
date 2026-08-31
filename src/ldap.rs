@@ -160,6 +160,7 @@ impl LdapClient {
 
 }
 #[cfg(test)]
+#[cfg(feature = "testcontainers")]
 mod tests {
     use std::fs;
     use std::net::IpAddr;
