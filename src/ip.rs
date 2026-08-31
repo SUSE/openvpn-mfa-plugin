@@ -22,6 +22,7 @@ impl MyIp for LocalIp {
 }
 
 #[cfg(test)]
+#[cfg(feature = "testcontainers")]
 pub mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use super::*;
