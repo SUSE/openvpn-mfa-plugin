@@ -49,7 +49,11 @@ impl LdapRequest {
 
     async fn connect(&self,client: &SocketAddr) -> anyhow::Result<(LdapConnAsync, Ldap)> {
         let url = Url::parse(&self.config.ldap).context("failed to parse url")?;
-        let addrs = url.socket_addrs(|| None).context("failed to resolve url")?;
+        let addrs = url.socket_addrs(|| match url.scheme() {
+            "ldap" => Some(389),
+            "ldaps" => Some(636),
+            _ => None,
+        }).context("failed to resolve url")?;
         let timeout = time::timeout(Duration::from_secs(1), TcpStream::connect(&addrs[0])).await;
 
         let mut tokio_stream = timeout.context("Timeout")?.context("tcp error")?;
@@ -154,11 +158,9 @@ impl LdapClient {
             ldap_request.check_credentials_async(&client, auth_control_file.as_path(), dn, password).await;
         });
     }
-
-
-
-
 }
+
+
 #[cfg(test)]
 #[cfg(feature = "testcontainers")]
 mod tests {
